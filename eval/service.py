@@ -1,3 +1,4 @@
+# pyright: reportMissingImports=false
 # ==============================================================================================================
 # Documentation for this evaluation file.
 
@@ -49,6 +50,7 @@ import signal
 import sys
 import threading
 import time
+from uuid import UUID
 
 import anyio
 import psutil
@@ -164,7 +166,7 @@ async def start_resource_monitoring(interval: int = 30):
 		"""Background monitoring loop"""
 		logger.info(f'Starting resource monitoring (interval: {interval}s)')
 		try:
-			while not _resource_monitor_stop_event.is_set():
+			while _resource_monitor_stop_event is not None and not _resource_monitor_stop_event.is_set():
 				try:
 					log_system_resources('MONITOR')
 
@@ -186,7 +188,10 @@ async def start_resource_monitoring(interval: int = 30):
 					logger.error(f'Error in resource monitoring: {type(e).__name__}: {e}')
 
 				try:
-					await asyncio.wait_for(_resource_monitor_stop_event.wait(), timeout=interval)
+					if _resource_monitor_stop_event is not None:
+						await asyncio.wait_for(_resource_monitor_stop_event.wait(), timeout=interval)
+					else:
+						await asyncio.sleep(interval)
 					break  # Event was set, exit loop
 				except TimeoutError:
 					continue  # Timeout reached, continue monitoring
@@ -488,7 +493,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_openai import ChatOpenAI
 from pydantic.types import SecretStr
 
-from browser_use import ActionResult, Agent, BrowserSession, Controller
+from browser_use import ActionResult, Agent, BrowserProfile, BrowserSession, Controller
 from browser_use.agent.memory import MemoryConfig
 from browser_use.agent.views import AgentHistoryList
 
@@ -1271,15 +1276,17 @@ async def load_existing_result(task_folder: Path) -> dict:
 	return existing_result
 
 
-async def setup_browser_session(task: Task, headless: bool) -> BrowserSession:
+async def setup_browser_session(task: Task, headless: bool, highlight_elements: bool = True) -> BrowserSession:
 	"""Setup browser session for the task"""
 	logger.debug(f'Browser setup: Initializing BrowserSession for task {task.task_id}')
 
 	# Use incognito mode (user_data_dir=None) for evaluations to avoid state pollution
-	browser_session = BrowserSession(
+	profile = BrowserProfile(
 		user_data_dir=None,  # Incognito mode - no persistent state
 		headless=headless,
 		chromium_sandbox=False,  # running in docker
+		highlight_elements=highlight_elements,  # Control element highlighting (passed to profile)
+		keep_alive=True,
 		# higher timeouts = higher success rates on long tail of slow sites or if on a slow CI server
 		# timeout=60_000,
 		# default_timeout=60_000,
@@ -1289,6 +1296,8 @@ async def setup_browser_session(task: Task, headless: bool) -> BrowserSession:
 		# wait_between_actions=0.5,
 		# ignore_https_errors=True,  # some eval tasks have http:// or broken https sites in them
 	)
+
+	browser_session = BrowserSession(browser_profile=profile)
 
 	# Start browser session
 	logger.debug(f'Browser setup: Starting browser session for task {task.task_id}')
@@ -1304,7 +1313,7 @@ async def setup_browser_session(task: Task, headless: bool) -> BrowserSession:
 	return browser_session
 
 
-@observe(name='executor', span_type='EXECUTOR')
+@observe(name='executor', span_type='EXECUTOR')  # type: ignore[arg-type]
 async def run_agent_with_browser(
 	browser_session: BrowserSession,
 	task: Task,
@@ -1347,7 +1356,7 @@ async def run_agent_with_browser(
 	return agent.state.history
 
 
-@observe(name='evaluate_task_result', span_type='EVALUATOR')
+@observe(name='evaluate_task_result', span_type='EVALUATOR')  # type: ignore[arg-type]
 async def evaluate_task_result(eval_model: BaseChatModel, task_folder: Path) -> dict:
 	"""Evaluate the task result"""
 	return await judge_task_result(eval_model, task_folder, score_threshold=3)
@@ -1388,12 +1397,12 @@ def determine_current_stage(completed_stages: set) -> Stage:
 		return Stage.LOAD_EXISTING  # Default starting stage
 
 
-@observe(name='evaluation', span_type='EVALUATION')
+@observe(name='evaluation', span_type='EVALUATION')  # type: ignore[arg-type]
 async def run_task_with_semaphore(
 	task: Task,
 	run_id: str,
-	lmnr_run_id: str,
-	laminar_eval_link: str,
+	lmnr_run_id: str | None,
+	laminar_eval_link: str | None,
 	convex_url: str,
 	secret_key: str,
 	eval_model: BaseChatModel,
@@ -1411,6 +1420,7 @@ async def run_task_with_semaphore(
 	planner_llm: BaseChatModel | None = None,
 	planner_interval: int = 1,
 	include_result: bool = False,
+	highlight_elements: bool = True,
 ) -> dict:
 	"""Clean pipeline approach for running tasks"""
 	task_start_time = time.time()
@@ -1436,7 +1446,7 @@ async def run_task_with_semaphore(
 			if lmnr_run_id:
 				try:
 					datapoint_id = await laminar_client.evals.create_datapoint(
-						eval_id=lmnr_run_id,
+						eval_id=UUID(lmnr_run_id),
 						data={
 							'task_id': task.task_id,
 							'confirmed_task': task.confirmed_task,
@@ -1498,7 +1508,7 @@ async def run_task_with_semaphore(
 					try:
 						logger.info(f'Task {task.task_id}: Browser setup starting.')
 						browser_session = await run_stage(
-							Stage.SETUP_BROWSER, lambda: setup_browser_session(task, headless), timeout=120
+							Stage.SETUP_BROWSER, lambda: setup_browser_session(task, headless, highlight_elements), timeout=120
 						)
 						task_result.stage_completed(Stage.SETUP_BROWSER)
 						logger.info(f'Task {task.task_id}: Browser session started successfully.')
@@ -1570,7 +1580,7 @@ async def run_task_with_semaphore(
 
 						if lmnr_run_id and datapoint_id:
 							await laminar_client.evals.update_datapoint(
-								eval_id=lmnr_run_id,
+								eval_id=UUID(lmnr_run_id),
 								datapoint_id=datapoint_id,
 								scores={
 									'accuracy': evaluation['score'],
@@ -1586,7 +1596,9 @@ async def run_task_with_semaphore(
 					logger.info(f'Task {task.task_id}: Saving result to server.')
 					await run_stage(
 						Stage.SAVE_SERVER,
-						lambda: asyncio.to_thread(save_result_to_server, convex_url, secret_key, task_result.server_payload),
+						lambda: asyncio.to_thread(
+							save_result_to_server, convex_url, secret_key, task_result.server_payload if task_result else {}
+						),
 						timeout=60,
 					)
 					task_result.stage_completed(Stage.SAVE_SERVER)
@@ -1608,7 +1620,9 @@ async def run_task_with_semaphore(
 					logger.info(f'Task {task.task_id}: Attempting server save after timeout.')
 					await run_stage(
 						Stage.SAVE_SERVER,
-						lambda: asyncio.to_thread(save_result_to_server, convex_url, secret_key, task_result.server_payload),
+						lambda: asyncio.to_thread(
+							save_result_to_server, convex_url, secret_key, task_result.server_payload if task_result else {}
+						),
 						timeout=30,  # Shorter timeout for emergency save
 					)
 					task_result.stage_completed(Stage.SAVE_SERVER)
@@ -1625,7 +1639,9 @@ async def run_task_with_semaphore(
 					logger.info(f'Task {task.task_id}: Attempting server save after cancellation.')
 					await run_stage(
 						Stage.SAVE_SERVER,
-						lambda: asyncio.to_thread(save_result_to_server, convex_url, secret_key, task_result.server_payload),
+						lambda: asyncio.to_thread(
+							save_result_to_server, convex_url, secret_key, task_result.server_payload if task_result else {}
+						),
 						timeout=30,  # Shorter timeout for emergency save
 					)
 					task_result.stage_completed(Stage.SAVE_SERVER)
@@ -1642,7 +1658,9 @@ async def run_task_with_semaphore(
 					logger.info(f'Task {task.task_id}: Attempting server save after critical error.')
 					await run_stage(
 						Stage.SAVE_SERVER,
-						lambda: asyncio.to_thread(save_result_to_server, convex_url, secret_key, task_result.server_payload),
+						lambda: asyncio.to_thread(
+							save_result_to_server, convex_url, secret_key, task_result.server_payload if task_result else {}
+						),
 						timeout=30,  # Shorter timeout for emergency save
 					)
 					task_result.stage_completed(Stage.SAVE_SERVER)
@@ -1672,7 +1690,9 @@ async def run_task_with_semaphore(
 			# Try emergency server save
 			try:
 				logger.info(f'Task {task.task_id}: Attempting emergency server save after initialization error.')
-				await asyncio.to_thread(save_result_to_server, convex_url, secret_key, task_result.server_payload)
+				await asyncio.to_thread(
+					save_result_to_server, convex_url, secret_key, task_result.server_payload if task_result else {}
+				)
 			except Exception as save_e:
 				logger.error(f'Task {task.task_id}: Emergency server save after initialization error failed: {str(save_e)}')
 
@@ -1711,8 +1731,8 @@ async def run_multiple_tasks(
 	tasks: list[Task],
 	llm: BaseChatModel,
 	run_id: str,
-	lmnr_run_id: str,
-	laminar_eval_link: str,
+	lmnr_run_id: str | None,
+	laminar_eval_link: str | None,
 	convex_url: str,
 	secret_key: str,
 	eval_model: BaseChatModel,
@@ -1731,6 +1751,7 @@ async def run_multiple_tasks(
 	planner_llm: BaseChatModel | None = None,
 	planner_interval: int = 1,
 	include_result: bool = False,
+	highlight_elements: bool = True,
 ) -> dict:
 	"""
 	Run multiple tasks in parallel and evaluate results.
@@ -1807,6 +1828,7 @@ async def run_multiple_tasks(
 					planner_llm=planner_llm,
 					planner_interval=planner_interval,
 					include_result=include_result,
+					highlight_elements=highlight_elements,
 				)
 				for task in tasks_to_run
 			),
@@ -1853,7 +1875,7 @@ async def run_multiple_tasks(
 			failed_tasks += 1
 		else:
 			processed_results.append(result)
-			if result.get('success', False):
+			if isinstance(result, dict) and result.get('success', False):
 				successful_tasks += 1
 			else:
 				failed_tasks += 1
@@ -1954,7 +1976,7 @@ def get_git_info():
 
 
 # Helper function to start a new run on the server
-def start_new_run(convex_url: str, secret_key: str, run_details: dict, existing_run_id: str = None):
+def start_new_run(convex_url: str, secret_key: str, run_details: dict, existing_run_id: str | None = None):
 	"""Sends a request to start a new evaluation run and returns the run ID."""
 	if not convex_url or not secret_key:
 		logger.error('Error: Convex URL or Secret Key not provided for starting run.')
@@ -2081,6 +2103,7 @@ async def run_evaluation_pipeline(
 	planner_interval: int = 1,
 	include_result: bool = False,
 	laminar_eval_id: str | None = None,
+	highlight_elements: bool = True,
 ) -> dict:
 	"""
 	Complete evaluation pipeline that handles Laminar setup and task execution in the same event loop
@@ -2130,6 +2153,7 @@ async def run_evaluation_pipeline(
 		planner_llm=planner_llm,
 		planner_interval=planner_interval,
 		include_result=include_result,
+		highlight_elements=highlight_elements,
 	)
 
 
@@ -2183,6 +2207,13 @@ if __name__ == '__main__':
 		'--include-result',
 		action='store_true',
 		help='Include result flag (functionality to be implemented)',
+	)
+	parser.add_argument(
+		'--no-highlight-elements',
+		action='store_false',
+		dest='highlight_elements',
+		default=True,
+		help='Disable highlighting of interactive elements on the page (highlighting is enabled by default)',
 	)
 	parser.add_argument(
 		'--laminar-eval-id',
@@ -2417,6 +2448,7 @@ if __name__ == '__main__':
 				planner_interval=args.planner_interval,
 				include_result=args.include_result,
 				laminar_eval_id=args.laminar_eval_id,
+				highlight_elements=args.highlight_elements,
 			)
 		)
 
